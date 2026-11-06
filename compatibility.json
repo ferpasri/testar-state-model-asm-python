@@ -1,0 +1,15 @@
+{
+    "specification": "https://github.com/ferpasri/testar-state-model-asm-specs",
+    "release": "v0.3.1",
+    "case_format_version": 1,
+    "asm_contract": 2,
+    "evidence_schema": 3,
+    "rule_language": 1,
+    "abstraction_behavior": "1.2.0",
+    "asms": {
+        "unvisited": 1,
+        "random": 1
+    },
+    "controller": 1,
+    "archive_sha256": "e89c167528207607356a52058175d91ee8b93d1a562ad7d595d6271332b5eb74"
+}

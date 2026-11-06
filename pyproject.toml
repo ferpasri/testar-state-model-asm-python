@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "testar-state-model-asm"
+version = "0.3.0"
+description = "Native TESTAR model-based exploration and action selection"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "BSD-3-Clause"
+license-files = ["LICENSE"]
+dependencies = ["testar-evidence>=0.3.2,<0.4", "testar-abstraction>=0.3,<0.4"]
+
+[project.urls]
+Repository = "https://github.com/ferpasri/testar-state-model-asm-python"
+Specifications = "https://github.com/ferpasri/testar-state-model-asm-specs"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.data-files]
+"share/testar-state-model-asm" = ["compatibility.json"]
