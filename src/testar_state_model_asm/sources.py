@@ -1,9 +1,55 @@
 """Prepare selection-relevant source snapshots from validated evidence traces."""
 
+from decimal import Decimal
+from functools import lru_cache
 import hashlib
+import json
 
 from testar_evidence import EvidenceReader
 from testar_evidence.codec import dumps
+
+
+def _source_fingerprint(data):
+    """Hash the exact compact JSON bytes of an already validated source projection.
+
+    Stream tokens into the digest instead of converting and serializing another
+    complete copy. A bounded text cache reuses repeated property names and values.
+    """
+    digest = hashlib.sha256()
+
+    @lru_cache(maxsize=512)
+    def text_token(value):
+        return json.dumps(value, ensure_ascii=True).encode("ascii")
+
+    def write(value):
+        if isinstance(value, str):
+            digest.update(text_token(value))
+        elif isinstance(value, dict):
+            digest.update(b"{")
+            for index, key in enumerate(sorted(value)):
+                if index:
+                    digest.update(b",")
+                digest.update(text_token(key))
+                digest.update(b":")
+                write(value[key])
+            digest.update(b"}")
+        elif isinstance(value, list):
+            digest.update(b"[")
+            for index, item in enumerate(value):
+                if index:
+                    digest.update(b",")
+                write(item)
+            digest.update(b"]")
+        elif type(value) is int or isinstance(value, Decimal):
+            try:
+                digest.update(str(value).encode("ascii"))
+            except ValueError:
+                digest.update(str(Decimal(value)).encode("ascii"))
+        else:
+            digest.update(dumps(value, sort_keys=True).encode("ascii"))
+
+    write(data)
+    return digest.hexdigest()
 
 
 def evidence_source(evidence, source_id=None, *, label=None):
@@ -22,7 +68,7 @@ def evidence_source(evidence, source_id=None, *, label=None):
             for record in evidence.action_executions.values()
         ]
     }
-    fingerprint = hashlib.sha256(dumps(data, sort_keys=True).encode("utf-8")).hexdigest()
+    fingerprint = _source_fingerprint(data)
     return {"id": source_id, "label": label or source_id, "fingerprint": fingerprint, "evidence": data}
 
 

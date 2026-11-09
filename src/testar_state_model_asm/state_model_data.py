@@ -1,13 +1,10 @@
 """Validate reconstructed sources and retain immutable, source-qualified facts."""
 
-from copy import deepcopy
-from decimal import Decimal
-
 from testar_abstraction import preview_abstraction, build_abstract_model, AbstractionLimitError
 from testar_evidence import ReconstructedEvidence, EvidenceEvent, Manifest, EvidenceError
-from testar_evidence.codec import to_data
 
 from .errors import AsmError, require
+from .updates import PreparedSnapshot, same
 
 STATUSES = ("completed", "failed", "incomplete", "awaiting_execution_result", "awaiting_resulting_observation")
 PENDING = set(STATUSES[3:])
@@ -18,48 +15,15 @@ def ref_key(reference, field):
     return reference["source"], reference["run"], reference[field]
 
 
-def canonical(value):
-    """Compare JSON numbers by value, while retaining array order and boolean types."""
-    if isinstance(value, dict):
-        return ("object", tuple((key, canonical(value[key])) for key in sorted(value)))
-    if isinstance(value, list):
-        return ("array", tuple(canonical(item) for item in value))
-    if isinstance(value, bool) or value is None or isinstance(value, str):
-        return (type(value).__name__, value)
-    number = Decimal(str(value)) if isinstance(value, float) else Decimal(value)
-    sign, digits, exponent = number.as_tuple()
-    digits = list(digits)
-    while digits and digits[-1] == 0:
-        digits.pop()
-        exponent += 1
-    return ("number", sign if digits else 0, tuple(digits), exponent if digits else 0)
-
-
-def normalized_snapshot(snapshot):
-    """Order copied records consistently so input reordering does not look like new evidence."""
-    value = deepcopy(snapshot)
-    for source in value["sources"]:
-        for collection in source["evidence"].values():
-            collection.sort(key=lambda item: item.get("id", item.get("execution", {}).get("id", "")))
-    value["sources"].sort(key=lambda item: item["id"])
-    value["selected_runs"].sort(key=lambda item: (item["source"], item["run"]))
-    return value
-
-
-def validate_source(source):
-    """Use the evidence library to check whether the reconstructed lifecycle is possible."""
+def validate_source(source, previous=None):
+    """Validate new events against an independent copy of the accepted lifecycle."""
     evidence = source["evidence"]
-    # These temporary validation events are never written to a trace.
-    history = ReconstructedEvidence(Manifest(source["id"]))
-    counter = 0
+    # Reconstruct event order without copying the widgets held by each observation.
+    events = []
 
     def apply(kind, data):
-        nonlocal counter
-        counter += 1
-        history.apply(EvidenceEvent(str(counter), kind, data))
+        events.append((kind, data))
 
-    for action in evidence["actions"]:
-        apply("action_described", action)
     for run in sorted(evidence["runs"], key=lambda item: item["id"]):
         apply("test_run_started", {k: v for k, v in run.items() if k not in ("status", "reason")})
         sequences = sorted((s for s in evidence["sequences"] if s["test_run"] == run["id"]),
@@ -88,15 +52,45 @@ def validate_source(source):
             apply("test_run_finished", {"test_run": run["id"], "reason": run["reason"] or "Reconstructed run finished"})
         else:
             require(run["status"] == "running", "invalid_evidence", "Unknown run status.")
+    # Ordinary updates append events. Historical insertions use full validation.
+    extends_history = previous is not None and len(events) >= len(previous.events) and all(
+        before[0] == after[0] and same(before[1], after[1])
+        for before, after in zip(previous.events, events))
+    new_actions = [action for action in evidence["actions"]
+                   if previous is None or action["id"] not in previous.action_ids]
+    unchanged_history = extends_history and len(events) == len(previous.events) and not new_actions
+    if unchanged_history:
+        history = previous.history
+    else:
+        history = previous.history.snapshot() if extends_history else ReconstructedEvidence(Manifest(source["id"]))
+    pending = events[len(previous.events):] if extends_history else events
+    actions = new_actions if extends_history else evidence["actions"]
+    for kind, data in [("action_described", action) for action in actions] + pending:
+        history.apply(EvidenceEvent(str(history.event_count + 1), kind, data))
+    # Summary checks still run when no event was appended: a changed status
+    # or an observation outside all sequences must not bypass validation.
     actual = history.action_executions
     require(len(actual) == len(evidence["executions"]), "invalid_evidence", "Unresolved execution records.")
     for record in evidence["executions"]:
         require(actual[record["execution"]["id"]]["status"] == record["status"],
                 "invalid_evidence", "Execution status does not match its lifecycle.")
-    require(len(history.observations) == len(evidence["observations"]),
+    require(sum(kind == "observation_recorded" for kind, _ in events) == len(evidence["observations"]),
             "invalid_evidence", "Unresolved observation records.")
-    require(len(history.test_sequences) == len(evidence["sequences"]),
+    require(sum(kind == "test_sequence_started" for kind, _ in events) == len(evidence["sequences"]),
             "invalid_evidence", "Unresolved test sequence records.")
+
+    if unchanged_history:
+        return previous
+    return SourceValidation(history, events, {action["id"] for action in evidence["actions"]})
+
+
+class SourceValidation:
+    """Retain the checked lifecycle so the next GUI observation need not validate old states again."""
+
+    def __init__(self, history, events, action_ids):
+        self.history = history
+        self.events = events
+        self.action_ids = action_ids
 
 
 def check_extension(previous, incoming):
@@ -111,12 +105,12 @@ def check_extension(previous, incoming):
             after = indexed.get(identifier(before))
             require(after is not None, "conflicting_evidence", "An accepted record was removed.")
             if name in ("observations", "actions"):
-                require(canonical(before) == canonical(after), "conflicting_evidence", "An immutable record changed.")
+                require(same(before, after), "conflicting_evidence", "An immutable record changed.")
             elif name == "executions":
-                require(canonical(before["execution"]) == canonical(after["execution"]),
+                require(same(before["execution"], after["execution"]),
                         "conflicting_evidence", "Execution arguments changed.")
                 for field in ("executionResult", "resultingObservation"):
-                    require(before[field] is None or canonical(before[field]) == canonical(after[field]),
+                    require(before[field] is None or same(before[field], after[field]),
                             "conflicting_evidence", "An accepted execution result changed.")
                 require(before["status"] in PENDING or before["status"] == after["status"],
                         "conflicting_evidence", "A final execution status changed.")
@@ -126,9 +120,9 @@ def check_extension(previous, incoming):
             else:
                 immutable_before = {k: v for k, v in before.items() if k not in ("status", "reason")}
                 immutable_after = {k: v for k, v in after.items() if k not in ("status", "reason")}
-                require(canonical(immutable_before) == canonical(immutable_after),
+                require(same(immutable_before, immutable_after),
                         "conflicting_evidence", "Run or sequence content changed.")
-                require(before["status"] != "finished" or canonical(before) == canonical(after),
+                require(before["status"] != "finished" or same(before, after),
                         "conflicting_evidence", "A finished lifecycle changed.")
 
 
@@ -142,12 +136,22 @@ class StateModelData:
     def __init__(self, sources, selected_runs, rules):
         """Validate traces, index the selected runs, and apply abstraction to build their model."""
         try:
-            snapshot = to_data({"sources": sources, "selected_runs": selected_runs})
-            self.snapshot = normalized_snapshot(snapshot)
+            prepared = PreparedSnapshot(sources, selected_runs)
+        except (EvidenceError, KeyError, TypeError, ValueError) as error:
+            raise AsmError("invalid_evidence", str(error)) from error
+        self._load(prepared, rules)
+
+    def _load(self, prepared, rules, previous=None):
+        """Build candidate data separately, so rejected updates cannot alter the accepted run."""
+        try:
+            self.snapshot = prepared.snapshot
+            self.record_fingerprints = prepared.record_fingerprints
+            selected_runs = self.snapshot["selected_runs"]
             self.sources = {source["id"]: source for source in self.snapshot["sources"]}
-            require(len(self.sources) == len(sources), "invalid_evidence", "Repeated source identity.")
-            for source in self.sources.values():
-                validate_source(source)
+            require(len(self.sources) == len(self.snapshot["sources"]), "invalid_evidence", "Repeated source identity.")
+            previous_validations = previous.validations if previous is not None else {}
+            self.validations = {source["id"]: validate_source(source, previous_validations.get(source["id"]))
+                                for source in self.sources.values()}
             self.runs = set()
             self.observations = {}
             self.executions = {}
@@ -181,18 +185,24 @@ class StateModelData:
                 raise
             raise AsmError("invalid_evidence", str(error)) from error
 
-    def extended(self, sources, selected_runs, rules):
-        """Build an updated model from additional evidence, reusing this instance when nothing changed."""
+    def extend_prepared(self, prepared, rules):
+        """Merge an owned update without copying or normalizing it a second time."""
+        sources = prepared.snapshot["sources"]
+        selected_runs = prepared.snapshot["selected_runs"]
         require(self.runs.issubset({(r["source"], r["run"]) for r in selected_runs}),
                 "conflicting_evidence", "Selected runs cannot be removed.")
         require(len({source["id"] for source in sources}) == len(sources),
                 "invalid_evidence", "Repeated source identity in update.")
-        merged = deepcopy(self.sources)
+        merged = dict(self.sources)
         for source in sources:
             if source["id"] in merged:
                 check_extension(merged[source["id"]], source)
-            merged[source["id"]] = deepcopy(source)
-        candidate = normalized_snapshot({"sources": list(merged.values()), "selected_runs": selected_runs})
-        if canonical(candidate) == canonical(self.snapshot):
+            merged[source["id"]] = source
+        candidate = {"sources": sorted(merged.values(), key=lambda item: item["id"]), "selected_runs": selected_runs}
+        if same(candidate, self.snapshot):
             return self
-        return StateModelData(candidate["sources"], candidate["selected_runs"], rules)
+        prepared.snapshot = candidate
+        prepared.record_fingerprints = {**self.record_fingerprints, **prepared.record_fingerprints}
+        updated = object.__new__(StateModelData)
+        updated._load(prepared, rules, self)
+        return updated

@@ -9,7 +9,8 @@ from testar_abstraction import parse_abstraction_rules
 from testar_evidence.codec import dumps, to_data
 
 from .errors import AsmError, require
-from .state_model_data import StateModelData, PENDING, canonical, normalized_snapshot, ref_key
+from .state_model_data import StateModelData, PENDING, ref_key
+from .updates import PreparedSnapshot, same
 from .action_selector import ActionSelector
 
 
@@ -93,7 +94,7 @@ class AsmRun:
         identifier = candidate.get("context_id")
         require(isinstance(identifier, str) and bool(identifier.strip()), "invalid_context", "A context ID is required.")
         if identifier in self._contexts:
-            require(canonical(self._contexts[identifier]) == canonical(candidate),
+            require(same(self._contexts[identifier], candidate),
                     "context_conflict", "The context identifier has different content.")
             require(self._context is not None and identifier == self._context["context_id"],
                     "stale_context", "This context has been retired.")
@@ -193,17 +194,21 @@ class AsmRun:
     def _prepare_update(self, update_id, sources, selected_runs):
         """Check incoming evidence without changing the run; repeated update IDs must retain their data."""
         require(isinstance(update_id, str) and bool(update_id.strip()), "invalid_evidence", "An update ID is required.")
-        payload = normalized_snapshot({"sources": sources, "selected_runs": selected_runs})
-        previous = self._updates.get(update_id)
-        require(previous is None or canonical(previous) == canonical(payload),
-                "conflicting_update", "Update identifier has different content.")
-        candidate = self._state_model_data.extended(sources, selected_runs, self._rules)
-        changed = canonical(candidate.snapshot) != canonical(self._state_model_data.snapshot)
-        return candidate, changed, payload
+        try:
+            prepared = PreparedSnapshot(sources, selected_runs, self._state_model_data)
+            previous = self._updates.get(update_id)
+            require(previous is None or previous == prepared.fingerprint,
+                    "conflicting_update", "Update identifier has different content.")
+            candidate = self._state_model_data.extend_prepared(prepared, self._rules)
+        except (KeyError, TypeError, ValueError) as error:
+            if isinstance(error, AsmError):
+                raise
+            raise AsmError("invalid_evidence", str(error)) from error
+        return candidate, candidate is not self._state_model_data, prepared.fingerprint
 
-    def _accept_update(self, update_id, candidate, changed, payload):
+    def _accept_update(self, update_id, candidate, changed, fingerprint):
         """Install checked evidence and discard decisions or observations made outdated by the update."""
-        self._updates[update_id] = deepcopy(payload)
+        self._updates[update_id] = fingerprint
         if changed:
             self._state_model_data = candidate
             self.asm_data_revision += 1
@@ -224,8 +229,8 @@ class AsmRun:
     @_serialized
     def update_evidence(self, update_id, sources, selected_runs):
         """Update the abstract model from recorded evidence, such as a newly captured state."""
-        candidate, changed, payload = self._prepare_update(update_id, sources, selected_runs)
-        self._accept_update(update_id, candidate, changed, payload)
+        candidate, changed, fingerprint = self._prepare_update(update_id, sources, selected_runs)
+        self._accept_update(update_id, candidate, changed, fingerprint)
         return self._result("evidence_updated", changed=changed)
 
     @_serialized
@@ -235,7 +240,7 @@ class AsmRun:
         require(key in self._execution_contexts, "unknown_execution", "Execution was not begun through this ASM.")
         execution_context = self._execution_contexts[key]
         require(execution_context["invoked"] is not False, "unknown_execution", "This operation was never invoked.")
-        candidate, changed, payload = self._prepare_update(update_id, sources, selected_runs)
+        candidate, changed, fingerprint = self._prepare_update(update_id, sources, selected_runs)
         record = candidate.executions.get(key)
         require(record is not None, "execution_mismatch", "The reported execution is missing.")
         choice = execution_context["choice"]
@@ -244,7 +249,7 @@ class AsmRun:
         require(actual["source_observation"] == original["observation"] and
                 actual["action_description"] == choice["action_description"] and actual["target_widget"] == choice["target_widget"],
                 "execution_mismatch", "Reported execution does not belong to the selected action.")
-        self._accept_update(update_id, candidate, changed, payload)
+        self._accept_update(update_id, candidate, changed, fingerprint)
         execution_context["invoked"] = True
         # A later result report must not count the same execution a second time.
         if key not in self._counted:
